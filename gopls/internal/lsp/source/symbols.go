@@ -24,11 +24,7 @@ func DocumentSymbols(ctx context.Context, snapshot Snapshot, fh FileHandle) ([]p
 		return nil, fmt.Errorf("getting file for DocumentSymbols: %w", err)
 	}
 
-	// Build symbols for file declarations. When encountering a declaration with
-	// errors (typically because positions are invalid), we skip the declaration
-	// entirely. VS Code fails to show any symbols if one of the top-level
-	// symbols is missing position information.
-	var symbols []protocol.DocumentSymbol
+	funcTypeMap := make(map[string][]protocol.DocumentSymbol)
 	for _, decl := range pgf.File.Decls {
 		switch decl := decl.(type) {
 		case *ast.FuncDecl:
@@ -37,12 +33,31 @@ func DocumentSymbols(ctx context.Context, snapshot Snapshot, fh FileHandle) ([]p
 			}
 			fs, err := funcSymbol(pgf.Mapper, pgf.Tok, decl)
 			if err == nil {
-				// If function is a method, prepend the type of the method.
+				var recvName string
 				if decl.Recv != nil && len(decl.Recv.List) > 0 {
 					fs.Name = fmt.Sprintf("(%s).%s", types.ExprString(decl.Recv.List[0].Type), fs.Name)
+					recvName = recvTypeName(decl.Recv.List[0].Type)
+				} else {
+					recvName = "None"
 				}
-				symbols = append(symbols, fs)
+
+				if funcTypeMap[recvName] == nil {
+					funcTypeMap[recvName] = []protocol.DocumentSymbol{fs}
+				} else {
+					funcTypeMap[recvName] = append(funcTypeMap[recvName], fs)
+				}
 			}
+		}
+	}
+
+	// Build symbols for file declarations. When encountering a declaration with
+	// errors (typically because positions are invalid), we skip the declaration
+	// entirely. VS Code fails to show any symbols if one of the top-level
+	// symbols is missing position information.
+	var symbols []protocol.DocumentSymbol
+	for _, decl := range pgf.File.Decls {
+		switch decl := decl.(type) {
+		case *ast.FuncDecl:
 		case *ast.GenDecl:
 			for _, spec := range decl.Specs {
 				switch spec := spec.(type) {
@@ -52,6 +67,14 @@ func DocumentSymbols(ctx context.Context, snapshot Snapshot, fh FileHandle) ([]p
 					}
 					ts, err := typeSymbol(pgf.Mapper, pgf.Tok, spec)
 					if err == nil {
+						if funcTypeMap[spec.Name.Name] != nil {
+							if ts.Children != nil {
+								ts.Children = append(ts.Children, funcTypeMap[spec.Name.Name]...)
+							} else {
+								ts.Children = funcTypeMap[spec.Name.Name]
+							}
+							delete(funcTypeMap, spec.Name.Name)
+						}
 						symbols = append(symbols, ts)
 					}
 				case *ast.ValueSpec:
@@ -68,7 +91,23 @@ func DocumentSymbols(ctx context.Context, snapshot Snapshot, fh FileHandle) ([]p
 			}
 		}
 	}
+
+	for _, funcSyms := range funcTypeMap {
+		symbols = append(symbols, funcSyms...)
+	}
+
 	return symbols, nil
+}
+
+func recvTypeName(recvType ast.Expr) string {
+	switch recvType := recvType.(type) {
+	case *ast.Ident:
+		return recvType.Name
+	case *ast.StarExpr:
+		return recvType.X.(*ast.Ident).Name
+	default:
+		return ""
+	}
 }
 
 func funcSymbol(m *protocol.Mapper, tf *token.File, decl *ast.FuncDecl) (protocol.DocumentSymbol, error) {
